@@ -23,7 +23,7 @@ pub const Chan = struct {
 
     /// Enqueues a node into the lock-free queue.
     /// The `node_to_add` must not be null and its `next` field will be set to null.
-    pub fn put(self: *Chan, node_to_add: *Node) void {
+    pub fn send(self: *Chan, node_to_add: *Node) void {
         // _ = th; // Mark as unused
         // _ = val; // Mark as unused
         // _ = q.P.fetchAdd(1, .monotonic);
@@ -55,10 +55,16 @@ pub const Chan = struct {
         }
     }
 
+    pub fn wait(self: *Chan) void {
+        var node: ?*Node = null;
+        while (node == null) node = self.recv();
+        return node.?;
+    }
+
     /// Dequeues a node from the lock-free queue.
     /// Returns a pointer to the dequeued node, or null if the queue is empty.
     /// The caller is responsible for using `@fieldParentPtr` to get the containing data structure.
-    pub fn pop(self: *Chan) ?*Node {
+    pub fn recv(self: *Chan) ?*Node {
         while (true) {
             std.atomic.spinLoopHint();
 
@@ -123,20 +129,20 @@ test "Chan operations: init, put, pop" {
     try testing.expect(q.tail.load(.monotonic) == &q.dummy_node);
 
     // Test enqueue one item
-    q.put(&item1_mem.node);
+    q.send(&item1_mem.node);
     try testing.expect(q.dummy_node.next.load(.acquire) == &item1_mem.node);
     try testing.expect(q.tail.load(.acquire) == &item1_mem.node);
     try testing.expect(item1_mem.node.next.load(.monotonic) == null);
 
     // Test enqueue second item
-    q.put(&item2_mem.node);
+    q.send(&item2_mem.node);
     try testing.expect(q.dummy_node.next.load(.acquire) == &item1_mem.node); // item1 is still first
     try testing.expect(item1_mem.node.next.load(.acquire) == &item2_mem.node); // item1 points to item2
     try testing.expect(q.tail.load(.acquire) == &item2_mem.node); // tail is item2
     try testing.expect(item2_mem.node.next.load(.monotonic) == null);
 
     // Test dequeue first item
-    var dequeued_node_ptr = q.pop();
+    var dequeued_node_ptr = q.recv();
     try testing.expect(dequeued_node_ptr != null);
     const dequeued_node = dequeued_node_ptr.?; // we know it's not null
     const dequeued_item1: *MyData = @fieldParentPtr("node", dequeued_node);
@@ -145,7 +151,7 @@ test "Chan operations: init, put, pop" {
     try testing.expect(q.tail.load(.acquire) == &item2_mem.node); // tail is item2
 
     // Test dequeue second item
-    dequeued_node_ptr = q.pop();
+    dequeued_node_ptr = q.recv();
     try testing.expect(dequeued_node_ptr != null);
     const dequeued_node2 = dequeued_node_ptr.?; // we know it's not null
     const dequeued_item2: *MyData = @fieldParentPtr("node", dequeued_node2);
@@ -154,7 +160,7 @@ test "Chan operations: init, put, pop" {
     try testing.expect(q.tail.load(.acquire) == &q.dummy_node); // Tail back to dummy
 
     // Test dequeue from empty queue
-    dequeued_node_ptr = q.pop();
+    dequeued_node_ptr = q.recv();
     try testing.expect(dequeued_node_ptr == null);
 }
 
