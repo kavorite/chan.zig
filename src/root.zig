@@ -12,6 +12,10 @@ pub const Chan = struct {
 
     pub const Node = struct {
         next: atomic.Value(?*Node),
+
+        pub fn make() Node {
+            return .{ .next = atomic.Value(?*Node).init(null) };
+        }
     };
 
     /// Initializes the queue.
@@ -19,12 +23,6 @@ pub const Chan = struct {
     pub fn init(self: *Chan) void {
         self.dummy_node.next.store(null, .monotonic); // No data depends on this yet
         self.tail.store(&self.dummy_node, .release); // Ensure dummy_node is initialized before tail is published
-    }
-
-    pub fn make() Chan {
-        var self: Chan = undefined;
-        self.init();
-        return self;
     }
 
     /// Enqueues a node into the lock-free queue.
@@ -124,8 +122,8 @@ test "Chan operations: init, put, pop" {
         node: Chan.Node,
     };
 
-    var item1_mem = MyData{ .id = 10, .node = .{ .next = atomic.Value(?*Chan.Node).init(null) } };
-    var item2_mem = MyData{ .id = 20, .node = .{ .next = atomic.Value(?*Chan.Node).init(null) } };
+    var item1_mem = MyData{ .id = 10, .node = Chan.Node.make() };
+    var item2_mem = MyData{ .id = 20, .node = Chan.Node.make() };
 
     // Test init state
     try testing.expect(q.dummy_node.next.load(.monotonic) == null);
