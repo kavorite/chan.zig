@@ -1,6 +1,3 @@
-//! By convention, root.zig is the root source file when making a library. If
-//! you are making an executable, the convention is to delete this file and
-//! start with main.zig instead.
 const std = @import("std");
 const atomic = std.atomic;
 const testing = std.testing;
@@ -13,14 +10,20 @@ const CACHE_LINE_SIZE = 64;
 pub const Handle = usize;
 
 pub const Queue = struct {
-    P: atomic.Value(usize) align(CACHE_LINE_SIZE),
-    C: atomic.Value(usize) align(CACHE_LINE_SIZE),
+    dummy_node: Node align(CACHE_LINE_SIZE),
+    tail: atomic.Value(*Node) align(CACHE_LINE_SIZE),
+
+    pub const Node = struct {
+        next: atomic.Value(?*Node),
+    };
 
     /// Initializes the queue.
-    /// Sets producer (P) and consumer (C) counters to 0.
+    /// Sets up the dummy node and initializes the tail pointer.
     pub fn init(self: *Queue) void {
-        self.P.store(0, .monotonic);
-        self.C.store(0, .monotonic);
+        // self.P.store(0, .monotonic);
+        // self.C.store(0, .monotonic);
+        self.dummy_node.next.store(null, .monotonic); // No data depends on this yet
+        self.tail.store(&self.dummy_node, .release); // Ensure dummy_node is initialized before tail is published
     }
 
     /// Registers a handle. In this implementation, it sets the handle to `id + 1`.
@@ -31,72 +34,169 @@ pub const Queue = struct {
         hd.* = @intCast(id + 1);
     }
 
-    pub fn enqueue(q: *Queue, th: *const Handle, val: ?*anyopaque) void {
-        _ = th; // Mark as unused
-        _ = val; // Mark as unused
-        _ = q.P.fetchAdd(1, .monotonic);
+    /// Enqueues a node into the lock-free queue.
+    /// The `node_to_add` must not be null and its `next` field will be set to null.
+    pub fn enqueue(self: *Queue, node_to_add: *Node) void {
+        // _ = th; // Mark as unused
+        // _ = val; // Mark as unused
+        // _ = q.P.fetchAdd(1, .monotonic);
+        node_to_add.next.store(null, .monotonic); // Initialize node's next pointer
+
+        while (true) {
+            std.atomic.spinLoopHint();
+
+            const local_tail = self.tail.load(.acquire);
+            const local_tail_next = local_tail.next.load(.acquire);
+
+            // Check if tail is still consistent.
+            if (local_tail == self.tail.load(.acquire)) {
+                if (local_tail_next == null) { // If tail is indeed the last node
+                    // Try to link the new node.
+                    // cmpxchgStrong returns null on success.
+                    if (local_tail.next.cmpxchgStrong(null, node_to_add, .release, .monotonic) == null) {
+                        // Successfully linked. Try to swing the tail pointer.
+                        // It's okay if this CAS fails, another enqueuer or dequeuer might fix it.
+                        _ = self.tail.cmpxchgStrong(local_tail, node_to_add, .release, .monotonic);
+                        return; // Enqueue successful
+                    }
+                } else { // Tail was not pointing to the last node (another enqueue is in progress).
+                    // Try to help by swinging the tail to the next node.
+                    // local_tail_next is guaranteed non-null here.
+                    _ = self.tail.cmpxchgStrong(local_tail, local_tail_next.?, .release, .monotonic);
+                }
+            }
+        }
     }
 
-    pub fn dequeue(q: *Queue, th: *const Handle) ?*anyopaque {
-        // Corresponds to FAA(&q->C, 1) with __ATOMIC_RELAXED
-        _ = q.C.fetchAdd(1, .monotonic); // Return value (old C) is ignored
+    /// Dequeues a node from the lock-free queue.
+    /// Returns a pointer to the dequeued node, or null if the queue is empty.
+    /// The caller is responsible for using `@fieldParentPtr` to get the containing data structure.
+    pub fn dequeue(self: *Queue) ?*Node {
+        while (true) {
+            std.atomic.spinLoopHint();
 
-        // Returns the thread's handle, cast to an opaque pointer.
-        return @ptrFromInt(th.*);
+            const head_is_dummy = &self.dummy_node;
+            const first_potential_node = head_is_dummy.next.load(.acquire);
+            const local_tail = self.tail.load(.acquire);
+
+            // Re-read head_is_dummy.next to protect against ABA, though head_is_dummy is stable.
+            // This mainly ensures first_potential_node is consistent with the current state of dummy_node.next
+            if (head_is_dummy.next.load(.acquire) != first_potential_node) {
+                continue; // state changed, retry
+            }
+
+            if (first_potential_node == null) { // Queue is empty
+                return null;
+            }
+
+            // first_potential_node is not null here
+            const first_node_actual = first_potential_node.?;
+
+            if (head_is_dummy == local_tail) {
+                // Head is tail. This means either the queue is empty (checked above)
+                // or tail is lagging. If first_potential_node is not null, tail is lagging.
+                // Help advance the tail.
+                _ = self.tail.cmpxchgStrong(local_tail, first_node_actual, .release, .monotonic);
+                // Continue to retry, as the state is changing or we need to re-evaluate.
+            } else {
+                // Queue is not empty and head is not tail.
+                // Try to dequeue first_potential_node.
+                const node_after_first = first_node_actual.next.load(.acquire);
+                // cmpxchgStrong returns null on success.
+                if (head_is_dummy.next.cmpxchgStrong(first_potential_node, node_after_first, .acq_rel, .acquire) == null) {
+                    // Successfully unlinked first_potential_node.
+                    // If tail was pointing to the dequeued node, it might need an update.
+                    // Specifically, if the queue becomes empty, tail should point back to dummy.
+                    if (local_tail == first_potential_node) {
+                        // local_tail == first_potential_node implies first_potential_node is not null.
+                        _ = self.tail.cmpxchgStrong(first_potential_node.?, head_is_dummy, .release, .monotonic);
+                    }
+                    return first_potential_node; // Return the dequeued node
+                }
+            }
+        }
     }
 };
 
-test "Queue operations: init, register, enqueue, dequeue" {
-    var q_mem: Queue = undefined; // Memory for the queue
+test "Queue operations: init, enqueue, dequeue intrusive" {
+    var q: Queue = undefined;
+    q.init();
 
-    // Initialize queue
-    q_mem.init(); // nprocs = 0 (unused)
-    try testing.expectEqual(@as(usize, 0), q_mem.P.load(.seq_cst));
-    try testing.expectEqual(@as(usize, 0), q_mem.C.load(.seq_cst));
+    // We need a data structure to embed the Node
+    const MyData = struct {
+        id: i32,
+        node: Queue.Node,
+    };
 
-    var handle: Handle = 0;
-    const test_id: i32 = 10;
-    const expected_handle_val: Handle = @intCast(test_id + 1);
+    var item1_mem = MyData{ .id = 10, .node = .{ .next = atomic.Value(?*Queue.Node).init(null) } };
+    var item2_mem = MyData{ .id = 20, .node = .{ .next = atomic.Value(?*Queue.Node).init(null) } };
 
-    // Test register
-    q_mem.register(&handle, test_id);
-    try testing.expectEqual(expected_handle_val, handle);
+    // Test init state
+    try testing.expect(q.dummy_node.next.load(.monotonic) == null);
+    try testing.expect(q.tail.load(.monotonic) == &q.dummy_node);
 
-    // Test enqueue
-    q_mem.enqueue(&handle, null); // val can be null
-    try testing.expectEqual(@as(usize, 1), q_mem.P.load(.seq_cst));
-    try testing.expectEqual(@as(usize, 0), q_mem.C.load(.seq_cst)); // C should not be affected
+    // Test enqueue one item
+    q.enqueue(&item1_mem.node);
+    try testing.expect(q.dummy_node.next.load(.acquire) == &item1_mem.node);
+    try testing.expect(q.tail.load(.acquire) == &item1_mem.node);
+    try testing.expect(item1_mem.node.next.load(.monotonic) == null);
 
-    q_mem.enqueue(&handle, null);
-    try testing.expectEqual(@as(usize, 2), q_mem.P.load(.seq_cst));
+    // Test enqueue second item
+    q.enqueue(&item2_mem.node);
+    try testing.expect(q.dummy_node.next.load(.acquire) == &item1_mem.node); // item1 is still first
+    try testing.expect(item1_mem.node.next.load(.acquire) == &item2_mem.node); // item1 points to item2
+    try testing.expect(q.tail.load(.acquire) == &item2_mem.node); // tail is item2
+    try testing.expect(item2_mem.node.next.load(.monotonic) == null);
 
-    // Test dequeue
-    const ret_val_ptr = q_mem.dequeue(&handle);
-    try testing.expectEqual(@as(usize, 1), q_mem.C.load(.seq_cst));
-    try testing.expectEqual(@as(usize, 2), q_mem.P.load(.seq_cst)); // P should not be affected
+    // Test dequeue first item
+    var dequeued_node_ptr = q.dequeue();
+    try testing.expect(dequeued_node_ptr != null);
+    const dequeued_node = dequeued_node_ptr.?; // we know it's not null
+    const dequeued_item1: *MyData = @fieldParentPtr("node", dequeued_node);
+    try testing.expectEqual(@as(i32, 10), dequeued_item1.id);
+    try testing.expect(q.dummy_node.next.load(.acquire) == &item2_mem.node); // item2 is now first
+    try testing.expect(q.tail.load(.acquire) == &item2_mem.node); // tail is item2
 
-    // Check returned value from dequeue (should be the handle cast to a pointer)
-    const expected_ptr_val: *anyopaque = @ptrFromInt(expected_handle_val);
-    try testing.expectEqual(expected_ptr_val, ret_val_ptr);
+    // Test dequeue second item
+    dequeued_node_ptr = q.dequeue();
+    try testing.expect(dequeued_node_ptr != null);
+    const dequeued_node2 = dequeued_node_ptr.?; // we know it's not null
+    const dequeued_item2: *MyData = @fieldParentPtr("node", dequeued_node2);
+    try testing.expectEqual(@as(i32, 20), dequeued_item2.id);
+    try testing.expect(q.dummy_node.next.load(.acquire) == null); // Queue is empty
+    try testing.expect(q.tail.load(.acquire) == &q.dummy_node); // Tail back to dummy
 
-    // Dequeue again
-    _ = q_mem.dequeue(&handle);
-    try testing.expectEqual(@as(usize, 2), q_mem.C.load(.seq_cst));
+    // Test dequeue from empty queue
+    dequeued_node_ptr = q.dequeue();
+    try testing.expect(dequeued_node_ptr == null);
 }
 
 test "Queue field alignment" {
-    // Test that P and C are cache aligned.
-    // Offset of P should be 0 (or a multiple of CACHE_LINE_SIZE if struct itself is further aligned).
-    // Offset of C should be CACHE_LINE_SIZE (or P_offset + CACHE_LINE_SIZE).
-    try testing.expectEqual(0, @offsetOf(Queue, "P") % CACHE_LINE_SIZE);
-    try testing.expectEqual(0, @offsetOf(Queue, "C") % CACHE_LINE_SIZE);
+    // Test that dummy_node and tail are cache aligned.
+    try testing.expectEqual(0, @offsetOf(Queue, "dummy_node") % CACHE_LINE_SIZE);
+    try testing.expectEqual(0, @offsetOf(Queue, "tail") % CACHE_LINE_SIZE);
 
-    // Check that C is on a different cache line than P, assuming usize is smaller than CACHE_LINE_SIZE
-    if (@sizeOf(usize) < CACHE_LINE_SIZE) {
-        try testing.expect(@offsetOf(Queue, "C") >= @offsetOf(Queue, "P") + CACHE_LINE_SIZE);
+    // Check that tail is on a different cache line than dummy_node's fields,
+    // assuming Node (dummy_node) is smaller than CACHE_LINE_SIZE.
+    if (@sizeOf(Queue.Node) < CACHE_LINE_SIZE) {
+        try testing.expect(@offsetOf(Queue, "tail") >= @offsetOf(Queue, "dummy_node") + CACHE_LINE_SIZE or
+            @offsetOf(Queue, "tail") < @offsetOf(Queue, "dummy_node")); // Could be before if packed differently
+        // A stronger test: their start addresses relative to struct start should differ by a multiple of cache line size
+        // if they are on different cache lines.
+        // Or, more simply, ensure they are not in the same cache line if they are distinct.
+        const dummy_node_start = @offsetOf(Queue, "dummy_node");
+        const tail_start = @offsetOf(Queue, "tail");
+        if (dummy_node_start / CACHE_LINE_SIZE != tail_start / CACHE_LINE_SIZE) {
+            // They are in different cache lines, good.
+        } else {
+            // They are in the same cache line. Ensure dummy_node + its size doesn't overlap tail
+            // or tail + its size doesn't overlap dummy_node.
+            // This is generally ensured by distinct field offsets.
+            // The primary concern is false sharing if they are very close on the *same* line.
+            // The align(CACHE_LINE_SIZE) on both fields should segregate them.
+            try testing.expect(tail_start >= dummy_node_start + @sizeOf(Queue.Node) or
+                dummy_node_start >= tail_start + @sizeOf(atomic.Value(*Queue.Node)));
+        }
     }
-    // More directly, C's offset should be a multiple of cache line size, and P's offset too.
-    // If P is at 0, C should be at 64 (or 128 etc.)
-    // This also implicitly tests P and C are not overlapping if CACHE_LINE_SIZE > 0
-    try testing.expect(@offsetOf(Queue, "C") != @offsetOf(Queue, "P"));
+    try testing.expect(@offsetOf(Queue, "tail") != @offsetOf(Queue, "dummy_node"));
 }
