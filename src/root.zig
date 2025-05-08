@@ -5,11 +5,8 @@ const testing = std.testing;
 // From align.h: #define CACHE_LINE_SIZE 64
 const CACHE_LINE_SIZE = 64;
 
-/// Queue structure with cache-aligned atomic producer and consumer counters.
-/// Handle type, typically representing a thread identifier or similar.
-pub const Handle = usize;
-
-pub const Queue = struct {
+/// Channel with cache-aligned atomic producer and consumer counters.
+pub const Chan = struct {
     dummy_node: Node align(CACHE_LINE_SIZE),
     tail: atomic.Value(*Node) align(CACHE_LINE_SIZE),
 
@@ -19,24 +16,14 @@ pub const Queue = struct {
 
     /// Initializes the queue.
     /// Sets up the dummy node and initializes the tail pointer.
-    pub fn init(self: *Queue) void {
-        // self.P.store(0, .monotonic);
-        // self.C.store(0, .monotonic);
+    pub fn init(self: *Chan) void {
         self.dummy_node.next.store(null, .monotonic); // No data depends on this yet
         self.tail.store(&self.dummy_node, .release); // Ensure dummy_node is initialized before tail is published
     }
 
-    /// Registers a handle. In this implementation, it sets the handle to `id + 1`.
-    /// The `q` parameter is unused, matching the C implementation.
-    pub fn register(q: *Queue, hd: *Handle, id: i32) void {
-        _ = q; // Mark as unused
-        // Assuming id is non-negative or id + 1 fits in usize.
-        hd.* = @intCast(id + 1);
-    }
-
     /// Enqueues a node into the lock-free queue.
     /// The `node_to_add` must not be null and its `next` field will be set to null.
-    pub fn enqueue(self: *Queue, node_to_add: *Node) void {
+    pub fn put(self: *Chan, node_to_add: *Node) void {
         // _ = th; // Mark as unused
         // _ = val; // Mark as unused
         // _ = q.P.fetchAdd(1, .monotonic);
@@ -71,7 +58,7 @@ pub const Queue = struct {
     /// Dequeues a node from the lock-free queue.
     /// Returns a pointer to the dequeued node, or null if the queue is empty.
     /// The caller is responsible for using `@fieldParentPtr` to get the containing data structure.
-    pub fn dequeue(self: *Queue) ?*Node {
+    pub fn pop(self: *Chan) ?*Node {
         while (true) {
             std.atomic.spinLoopHint();
 
@@ -118,38 +105,38 @@ pub const Queue = struct {
     }
 };
 
-test "Queue operations: init, enqueue, dequeue intrusive" {
-    var q: Queue = undefined;
+test "Chan operations: init, put, pop" {
+    var q: Chan = undefined;
     q.init();
 
     // We need a data structure to embed the Node
     const MyData = struct {
         id: i32,
-        node: Queue.Node,
+        node: Chan.Node,
     };
 
-    var item1_mem = MyData{ .id = 10, .node = .{ .next = atomic.Value(?*Queue.Node).init(null) } };
-    var item2_mem = MyData{ .id = 20, .node = .{ .next = atomic.Value(?*Queue.Node).init(null) } };
+    var item1_mem = MyData{ .id = 10, .node = .{ .next = atomic.Value(?*Chan.Node).init(null) } };
+    var item2_mem = MyData{ .id = 20, .node = .{ .next = atomic.Value(?*Chan.Node).init(null) } };
 
     // Test init state
     try testing.expect(q.dummy_node.next.load(.monotonic) == null);
     try testing.expect(q.tail.load(.monotonic) == &q.dummy_node);
 
     // Test enqueue one item
-    q.enqueue(&item1_mem.node);
+    q.put(&item1_mem.node);
     try testing.expect(q.dummy_node.next.load(.acquire) == &item1_mem.node);
     try testing.expect(q.tail.load(.acquire) == &item1_mem.node);
     try testing.expect(item1_mem.node.next.load(.monotonic) == null);
 
     // Test enqueue second item
-    q.enqueue(&item2_mem.node);
+    q.put(&item2_mem.node);
     try testing.expect(q.dummy_node.next.load(.acquire) == &item1_mem.node); // item1 is still first
     try testing.expect(item1_mem.node.next.load(.acquire) == &item2_mem.node); // item1 points to item2
     try testing.expect(q.tail.load(.acquire) == &item2_mem.node); // tail is item2
     try testing.expect(item2_mem.node.next.load(.monotonic) == null);
 
     // Test dequeue first item
-    var dequeued_node_ptr = q.dequeue();
+    var dequeued_node_ptr = q.pop();
     try testing.expect(dequeued_node_ptr != null);
     const dequeued_node = dequeued_node_ptr.?; // we know it's not null
     const dequeued_item1: *MyData = @fieldParentPtr("node", dequeued_node);
@@ -158,7 +145,7 @@ test "Queue operations: init, enqueue, dequeue intrusive" {
     try testing.expect(q.tail.load(.acquire) == &item2_mem.node); // tail is item2
 
     // Test dequeue second item
-    dequeued_node_ptr = q.dequeue();
+    dequeued_node_ptr = q.pop();
     try testing.expect(dequeued_node_ptr != null);
     const dequeued_node2 = dequeued_node_ptr.?; // we know it's not null
     const dequeued_item2: *MyData = @fieldParentPtr("node", dequeued_node2);
@@ -167,25 +154,25 @@ test "Queue operations: init, enqueue, dequeue intrusive" {
     try testing.expect(q.tail.load(.acquire) == &q.dummy_node); // Tail back to dummy
 
     // Test dequeue from empty queue
-    dequeued_node_ptr = q.dequeue();
+    dequeued_node_ptr = q.pop();
     try testing.expect(dequeued_node_ptr == null);
 }
 
-test "Queue field alignment" {
+test "Chan field alignment" {
     // Test that dummy_node and tail are cache aligned.
-    try testing.expectEqual(0, @offsetOf(Queue, "dummy_node") % CACHE_LINE_SIZE);
-    try testing.expectEqual(0, @offsetOf(Queue, "tail") % CACHE_LINE_SIZE);
+    try testing.expectEqual(0, @offsetOf(Chan, "dummy_node") % CACHE_LINE_SIZE);
+    try testing.expectEqual(0, @offsetOf(Chan, "tail") % CACHE_LINE_SIZE);
 
     // Check that tail is on a different cache line than dummy_node's fields,
     // assuming Node (dummy_node) is smaller than CACHE_LINE_SIZE.
-    if (@sizeOf(Queue.Node) < CACHE_LINE_SIZE) {
-        try testing.expect(@offsetOf(Queue, "tail") >= @offsetOf(Queue, "dummy_node") + CACHE_LINE_SIZE or
-            @offsetOf(Queue, "tail") < @offsetOf(Queue, "dummy_node")); // Could be before if packed differently
+    if (@sizeOf(Chan.Node) < CACHE_LINE_SIZE) {
+        try testing.expect(@offsetOf(Chan, "tail") >= @offsetOf(Chan, "dummy_node") + CACHE_LINE_SIZE or
+            @offsetOf(Chan, "tail") < @offsetOf(Chan, "dummy_node")); // Could be before if packed differently
         // A stronger test: their start addresses relative to struct start should differ by a multiple of cache line size
         // if they are on different cache lines.
         // Or, more simply, ensure they are not in the same cache line if they are distinct.
-        const dummy_node_start = @offsetOf(Queue, "dummy_node");
-        const tail_start = @offsetOf(Queue, "tail");
+        const dummy_node_start = @offsetOf(Chan, "dummy_node");
+        const tail_start = @offsetOf(Chan, "tail");
         if (dummy_node_start / CACHE_LINE_SIZE != tail_start / CACHE_LINE_SIZE) {
             // They are in different cache lines, good.
         } else {
@@ -194,9 +181,9 @@ test "Queue field alignment" {
             // This is generally ensured by distinct field offsets.
             // The primary concern is false sharing if they are very close on the *same* line.
             // The align(CACHE_LINE_SIZE) on both fields should segregate them.
-            try testing.expect(tail_start >= dummy_node_start + @sizeOf(Queue.Node) or
-                dummy_node_start >= tail_start + @sizeOf(atomic.Value(*Queue.Node)));
+            try testing.expect(tail_start >= dummy_node_start + @sizeOf(Chan.Node) or
+                dummy_node_start >= tail_start + @sizeOf(atomic.Value(*Chan.Node)));
         }
     }
-    try testing.expect(@offsetOf(Queue, "tail") != @offsetOf(Queue, "dummy_node"));
+    try testing.expect(@offsetOf(Chan, "tail") != @offsetOf(Chan, "dummy_node"));
 }
