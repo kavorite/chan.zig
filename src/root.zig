@@ -21,12 +21,15 @@ pub const Chan = struct {
         self.tail.store(&self.dummy_node, .release); // Ensure dummy_node is initialized before tail is published
     }
 
+    pub fn make() Chan {
+        var self: Chan = undefined;
+        self.init();
+        return self;
+    }
+
     /// Enqueues a node into the lock-free queue.
     /// The `node_to_add` must not be null and its `next` field will be set to null.
     pub fn send(self: *Chan, node_to_add: *Node) void {
-        // _ = th; // Mark as unused
-        // _ = val; // Mark as unused
-        // _ = q.P.fetchAdd(1, .monotonic);
         node_to_add.next.store(null, .monotonic); // Initialize node's next pointer
 
         while (true) {
